@@ -6,6 +6,7 @@ import { conversations, messages, projects } from "../db/schema.js";
 import { eq } from "drizzle-orm";
 import { createGitSnapshot } from "./git-snapshot.js";
 import { broadcast, saveEvents, saveEventsNow } from "./sessions.js";
+import { dequeueNext, broadcastQueueState } from "./queue.js";
 import { broadcastAll } from "../ws.js";
 import { buildEffectiveSystemPrompt } from "./system-prompt.js";
 import { generateSummary } from "./summary.js";
@@ -198,9 +199,19 @@ export function sendMessage(session: AgentSession, message: string) {
       return;
     }
 
-    broadcast(session, { type: "agent:done", code });
+    // Drain the persistent queue: continue with the next message after a
+    // successful turn. On error/stop the queue is kept intact for the user.
+    const next = code === 0 ? dequeueNext(session.projectId, session.channel) : null;
+
+    broadcast(session, { type: "agent:done", code, willContinue: !!next });
     const finalStatus = code === 0 ? "done" : "error";
     broadcastAll({ type: "agent:status_change", projectId: session.projectId, status: finalStatus });
+
+    if (next) {
+      console.log(`[agent:${session.projectId}] draining queued message`);
+      dispatchMessage(session, next.content);
+      return;
+    }
 
     if (code === 0) {
       generateSummary(session);
@@ -218,4 +229,21 @@ export function sendMessage(session: AgentSession, message: string) {
       }
     }
   });
+}
+
+// Dispatch a message as a fresh turn: notify subscribers, then spawn the agent.
+function dispatchMessage(session: AgentSession, content: string) {
+  broadcastQueueState(session);
+  broadcast(session, { type: "agent:start", message: content });
+  sendMessage(session, content);
+}
+
+// If the agent is idle, pop the oldest queued message and run it.
+// Returns true if a message was dispatched.
+export function dispatchNext(session: AgentSession): boolean {
+  if (session.currentProcess) return false;
+  const next = dequeueNext(session.projectId, session.channel);
+  if (!next) return false;
+  dispatchMessage(session, next.content);
+  return true;
 }

@@ -24,11 +24,18 @@ interface Props {
   fileBlocks?: FileBlock[];
   onFileSelect?: (file: File) => Promise<FileBlock | null>;
   onRemoveFileBlock?: (id: string) => void;
+  enableSpeech?: boolean;
+  speechLang?: string;
   placeholder?: string;
   disabled?: boolean;
   className?: string;
   onKeyDown?: (e: React.KeyboardEvent) => void;
 }
+
+const SpeechRecognitionImpl: any =
+  typeof window !== "undefined"
+    ? (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition
+    : null;
 
 function formatBytes(n: number): string {
   if (n < 1024) return `${n} B`;
@@ -102,7 +109,7 @@ function valueToTokens(value: string, blocks: PasteBlock[], fileBlocks: FileBloc
 }
 
 export const RichPasteInput = forwardRef<RichPasteInputHandle, Props>(function RichPasteInput(
-  { value, onChange, onPasteBlock, onRemoveBlock, blocks, fileBlocks = [], onFileSelect, onRemoveFileBlock, placeholder, disabled, className, onKeyDown },
+  { value, onChange, onPasteBlock, onRemoveBlock, blocks, fileBlocks = [], onFileSelect, onRemoveFileBlock, enableSpeech, speechLang = "fr-FR", placeholder, disabled, className, onKeyDown },
   ref
 ) {
   const editorRef = useRef<HTMLDivElement>(null);
@@ -112,6 +119,11 @@ export const RichPasteInput = forwardRef<RichPasteInputHandle, Props>(function R
   const fileBlocksRef = useRef<FileBlock[]>(fileBlocks);
   const [dragOver, setDragOver] = useState(false);
   const [uploading, setUploading] = useState(false);
+  const [recording, setRecording] = useState(false);
+  const [interimTranscript, setInterimTranscript] = useState("");
+  const [speechError, setSpeechError] = useState<string | null>(null);
+  const recognitionRef = useRef<any>(null);
+  const speechSupported = !!SpeechRecognitionImpl && enableSpeech !== false;
   blocksRef.current = blocks;
   fileBlocksRef.current = fileBlocks;
 
@@ -239,6 +251,100 @@ export const RichPasteInput = forwardRef<RichPasteInputHandle, Props>(function R
     }, 0);
   }, [onChange, onPasteBlock]);
 
+  const insertTextAtCursor = useCallback((text: string) => {
+    const el = editorRef.current;
+    if (!el || !text) return;
+    el.focus();
+    const selection = window.getSelection();
+    const editorContains = selection && selection.rangeCount > 0 && el.contains(selection.anchorNode);
+    if (!editorContains) {
+      // Place cursor at end of editor
+      const range = document.createRange();
+      range.selectNodeContents(el);
+      range.collapse(false);
+      selection?.removeAllRanges();
+      selection?.addRange(range);
+    }
+    document.execCommand("insertText", false, text);
+    // Trigger onChange via the input event listener
+    const newValue = domToValue(el);
+    lastValueRef.current = newValue;
+    onChange(newValue);
+  }, [onChange]);
+
+  const stopRecording = useCallback(() => {
+    const rec = recognitionRef.current;
+    if (rec) {
+      try { rec.stop(); } catch {}
+    }
+    setRecording(false);
+    setInterimTranscript("");
+  }, []);
+
+  const startRecording = useCallback(() => {
+    if (!speechSupported || disabled || recording) return;
+    setSpeechError(null);
+    let recognition: any;
+    try {
+      recognition = new SpeechRecognitionImpl();
+    } catch (err) {
+      setSpeechError("Reconnaissance vocale non disponible");
+      return;
+    }
+    recognition.lang = speechLang;
+    recognition.continuous = true;
+    recognition.interimResults = true;
+
+    let finalText = "";
+    recognition.onresult = (e: any) => {
+      let interim = "";
+      let appended = "";
+      for (let i = e.resultIndex; i < e.results.length; i++) {
+        const result = e.results[i];
+        const text = result[0].transcript;
+        if (result.isFinal) appended += text;
+        else interim += text;
+      }
+      if (appended) {
+        finalText += appended;
+        insertTextAtCursor(appended);
+      }
+      setInterimTranscript(interim);
+    };
+    recognition.onerror = (e: any) => {
+      const code = e?.error ?? "unknown";
+      if (code === "no-speech" || code === "aborted") {
+        // benign, ignore
+      } else if (code === "not-allowed" || code === "service-not-allowed") {
+        setSpeechError("Microphone refuse. Autorise-le dans les permissions du navigateur.");
+      } else if (code === "network") {
+        setSpeechError(
+          "Erreur reseau : Web Speech route l'audio via Google. Sur Arc/Brave, desactive le shield/privacy block pour cette page (ou utilise Chrome)."
+        );
+      } else if (code === "audio-capture") {
+        setSpeechError("Aucun micro detecte. Branche un micro ou verifie le device par defaut.");
+      } else if (code === "language-not-supported") {
+        setSpeechError(`Langue non supportee (${recognition.lang}).`);
+      } else {
+        setSpeechError(`Erreur: ${code}`);
+      }
+    };
+    recognition.onend = () => {
+      setRecording(false);
+      setInterimTranscript("");
+      recognitionRef.current = null;
+    };
+
+    recognitionRef.current = recognition;
+    try {
+      recognition.start();
+      setRecording(true);
+    } catch (err: any) {
+      setSpeechError(err?.message ?? "Erreur lors du demarrage");
+      recognitionRef.current = null;
+    }
+  }, [speechSupported, disabled, recording, speechLang, insertTextAtCursor]);
+
   const insertFileBlock = useCallback((file: FileBlock) => {
     const el = editorRef.current;
     if (!el) return;
@@ -340,6 +446,30 @@ export const RichPasteInput = forwardRef<RichPasteInputHandle, Props>(function R
           </button>
         </>
       )}
+      {speechSupported && (
+        <button
+          type="button"
+          onClick={() => (recording ? stopRecording() : startRecording())}
+          disabled={disabled}
+          title={recording ? "Clique pour arreter l'ecoute" : "Clique pour parler"}
+          className={cn(
+            "absolute z-10 rounded-md p-1.5 select-none transition-colors",
+            onFileSelect ? "right-10" : "right-2",
+            "top-2",
+            recording
+              ? "bg-red-500/20 text-red-400 ring-2 ring-red-500/40 animate-pulse"
+              : "text-muted-foreground hover:bg-secondary-foreground/10 hover:text-foreground",
+            "disabled:opacity-50"
+          )}
+        >
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" />
+            <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+            <line x1="12" y1="19" x2="12" y2="23" />
+            <line x1="8" y1="23" x2="16" y2="23" />
+          </svg>
+        </button>
+      )}
       <div
         ref={editorRef}
         contentEditable={!disabled}
@@ -352,13 +482,26 @@ export const RichPasteInput = forwardRef<RichPasteInputHandle, Props>(function R
         onDrop={handleDrop}
         className={cn(
           "w-full h-full min-h-full resize-none overflow-y-auto rounded-lg border bg-secondary px-4 py-3 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-ring whitespace-pre-wrap break-words",
-          onFileSelect && "pr-9",
+          (onFileSelect || speechSupported) && "pr-9",
+          onFileSelect && speechSupported && "pr-16",
           dragOver && "ring-2 ring-primary/60 bg-primary/5",
+          recording && "ring-2 ring-red-500/40",
           disabled && "opacity-50 cursor-not-allowed",
           className
         )}
         style={{ minHeight: "100%" }}
       />
+      {recording && (
+        <div className="absolute bottom-1 left-3 right-3 flex items-center gap-2 text-[11px] text-red-400 pointer-events-none">
+          <span className="inline-block h-2 w-2 rounded-full bg-red-500 animate-pulse" />
+          <span className="font-mono">
+            {interimTranscript ? `"${interimTranscript}"` : "Ecoute... (clique a nouveau pour arreter)"}
+          </span>
+        </div>
+      )}
+      {speechError && !recording && (
+        <div className="absolute -bottom-5 left-3 text-[10px] text-red-400">{speechError}</div>
+      )}
     </div>
   );
 });

@@ -7,7 +7,15 @@ import {
   broadcast,
   stopAgent,
 } from "./sessions.js";
-import { sendMessage } from "./send-message.js";
+import { sendMessage, dispatchNext } from "./send-message.js";
+import {
+  enqueue,
+  updateQueued,
+  deleteQueued,
+  clearQueue,
+  listQueue,
+  broadcastQueueState,
+} from "./queue.js";
 import type { Channel } from "./types.js";
 
 const HISTORY_PAGE_SIZE = 500;
@@ -16,7 +24,12 @@ type WsMessage =
   | { type: "subscribe"; projectId: number; projectPath: string; channel?: Channel }
   | { type: "chat"; projectId: number; projectPath: string; message: string; channel?: Channel }
   | { type: "stop"; projectId: number; channel?: Channel }
-  | { type: "loadOlder"; projectId: number; channel?: Channel; beforeIndex: number; limit?: number };
+  | { type: "loadOlder"; projectId: number; channel?: Channel; beforeIndex: number; limit?: number }
+  | { type: "queue:add"; projectId: number; projectPath: string; content: string; channel?: Channel }
+  | { type: "queue:update"; projectId: number; id: number; content: string; channel?: Channel }
+  | { type: "queue:delete"; projectId: number; id: number; channel?: Channel }
+  | { type: "queue:clear"; projectId: number; channel?: Channel }
+  | { type: "queue:run"; projectId: number; projectPath: string; channel?: Channel };
 
 export function attachWsHandlers(wss: WebSocketServer) {
   const wsSubscriptions = new Map<WebSocket, string>();
@@ -43,6 +56,17 @@ export function attachWsHandlers(wss: WebSocketServer) {
       wsSubscriptions.delete(ws);
     });
   });
+}
+
+// Broadcast the current queue to all subscribers of a session, or — if no
+// session exists yet — directly to the requesting socket.
+function emitQueueState(ws: WebSocket, projectId: number, channel: Channel) {
+  const session = agentSessions.get(sessionKey(projectId, channel));
+  if (session) {
+    broadcastQueueState(session);
+  } else {
+    ws.send(JSON.stringify({ type: "queue:state", channel, queue: listQueue(projectId, channel) }));
+  }
 }
 
 function handleWsMessage(ws: WebSocket, msg: WsMessage, wsSubscriptions: Map<WebSocket, string>) {
@@ -90,6 +114,9 @@ function handleWsMessage(ws: WebSocket, msg: WsMessage, wsSubscriptions: Map<Web
     } else {
       ws.send(JSON.stringify({ type: "agent:ready", projectId: msg.projectId }));
     }
+
+    // Always send the persisted queue so it shows up after a reload/restart.
+    ws.send(JSON.stringify({ type: "queue:state", channel, queue: listQueue(msg.projectId, channel) }));
     return;
   }
 
@@ -111,11 +138,56 @@ function handleWsMessage(ws: WebSocket, msg: WsMessage, wsSubscriptions: Map<Web
     return;
   }
 
+  if (msg.type === "queue:add") {
+    const session = getOrCreateSession(msg.projectId, msg.projectPath, channel);
+    session.subscribers.add(ws);
+    wsSubscriptions.set(ws, sessionKey(msg.projectId, channel));
+
+    enqueue(msg.projectId, channel, msg.content);
+    broadcastQueueState(session);
+    // If the agent is idle, start draining right away.
+    dispatchNext(session);
+    return;
+  }
+
+  if (msg.type === "queue:run") {
+    const session = getOrCreateSession(msg.projectId, msg.projectPath, channel);
+    session.subscribers.add(ws);
+    wsSubscriptions.set(ws, sessionKey(msg.projectId, channel));
+    dispatchNext(session);
+    return;
+  }
+
+  if (msg.type === "queue:update") {
+    updateQueued(msg.id, msg.content);
+    emitQueueState(ws, msg.projectId, channel);
+    return;
+  }
+
+  if (msg.type === "queue:delete") {
+    deleteQueued(msg.id);
+    emitQueueState(ws, msg.projectId, channel);
+    return;
+  }
+
+  if (msg.type === "queue:clear") {
+    clearQueue(msg.projectId, channel);
+    emitQueueState(ws, msg.projectId, channel);
+    return;
+  }
+
   if (msg.type === "chat") {
     const session = getOrCreateSession(msg.projectId, msg.projectPath, channel);
     const key = sessionKey(msg.projectId, channel);
     session.subscribers.add(ws);
     wsSubscriptions.set(ws, key);
+
+    // Agent already busy (client status desync) — queue instead of dropping.
+    if (session.currentProcess) {
+      enqueue(msg.projectId, channel, msg.message);
+      broadcastQueueState(session);
+      return;
+    }
 
     broadcast(session, { type: "agent:start", message: msg.message });
     sendMessage(session, msg.message);

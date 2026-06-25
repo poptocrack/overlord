@@ -2,12 +2,14 @@ import React, { useEffect, useRef, useState, useCallback, useMemo } from "react"
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { cn } from "@/lib/utils";
-import { Square, Copy, Check, ArrowDown, Undo2, Plus } from "lucide-react";
+import { Square, Copy, Check, ArrowDown, Undo2, Plus, Pencil, X } from "lucide-react";
 import { Tooltip, TooltipTrigger, TooltipContent } from "@/components/ui/tooltip";
 import { MarkdownContent } from "./MarkdownContent.js";
 import { ToolUseCard } from "./ToolUseCard.js";
 import { RichPasteInput, type RichPasteInputHandle, type FileBlock } from "./RichPasteInput.js";
 import type { Project } from "../types.js";
+import { formatModelVersion } from "../lib/models.js";
+import { useModels } from "../hooks/useModels.js";
 
 type AgentStatus = "idle" | "waiting" | "running";
 type LearningsStatus = "idle" | "generating";
@@ -16,6 +18,11 @@ interface PastedBlock {
   id: string;
   content: string;
   lineCount: number;
+}
+
+interface QueuedMessage {
+  id: number;
+  content: string;
 }
 
 interface ChatEntry {
@@ -350,6 +357,134 @@ const MessageBubble = React.memo(function MessageBubble({ content, projectId }: 
   );
 });
 
+// Persistent message queue — list, edit and delete pending messages.
+function QueuePanel({
+  queue,
+  agentIdle,
+  onEdit,
+  onDelete,
+  onClear,
+  onRun,
+}: {
+  queue: QueuedMessage[];
+  agentIdle: boolean;
+  onEdit: (id: number, content: string) => void;
+  onDelete: (id: number) => void;
+  onClear: () => void;
+  onRun: () => void;
+}) {
+  const [editingId, setEditingId] = useState<number | null>(null);
+  const [draft, setDraft] = useState("");
+
+  if (queue.length === 0) return null;
+
+  const startEdit = (m: QueuedMessage) => {
+    setEditingId(m.id);
+    setDraft(m.content);
+  };
+  const cancelEdit = () => {
+    setEditingId(null);
+    setDraft("");
+  };
+  const saveEdit = () => {
+    if (editingId !== null && draft.trim()) onEdit(editingId, draft.trim());
+    cancelEdit();
+  };
+
+  return (
+    <div className="mb-2 overflow-hidden rounded-lg border border-yellow-400/20 bg-yellow-400/5">
+      <div className="flex items-center gap-2 border-b border-yellow-400/10 px-3 py-1.5">
+        <span className="flex h-5 min-w-5 items-center justify-center rounded-full bg-primary/20 px-1.5 text-[10px] font-bold text-primary">
+          {queue.length}
+        </span>
+        <span className="text-xs text-muted-foreground">
+          message{queue.length > 1 ? "s" : ""} en attente
+        </span>
+        {agentIdle && (
+          <button
+            onClick={onRun}
+            className="text-[10px] font-medium text-primary hover:underline"
+            title="Envoyer maintenant le prochain message de la file"
+          >
+            Reprendre
+          </button>
+        )}
+        <button
+          onClick={onClear}
+          className="ml-auto text-[10px] text-muted-foreground hover:text-destructive"
+        >
+          Vider la file
+        </button>
+      </div>
+      <div className="max-h-[28vh] divide-y divide-yellow-400/10 overflow-y-auto scrollbar-visible">
+        {queue.map((m, i) => (
+          <div key={m.id} className="flex items-start gap-2 px-3 py-2">
+            <span className="mt-0.5 shrink-0 font-mono text-[10px] text-muted-foreground/60">
+              {i + 1}.
+            </span>
+            {editingId === m.id ? (
+              <div className="flex flex-1 flex-col gap-1.5">
+                <textarea
+                  value={draft}
+                  onChange={(e) => setDraft(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+                      e.preventDefault();
+                      saveEdit();
+                    }
+                    if (e.key === "Escape") {
+                      e.preventDefault();
+                      cancelEdit();
+                    }
+                  }}
+                  autoFocus
+                  rows={3}
+                  className="w-full resize-y rounded border border-border bg-background px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-primary"
+                />
+                <div className="flex gap-1.5">
+                  <Button size="sm" className="h-6 text-[11px]" onClick={saveEdit}>
+                    Enregistrer
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    className="h-6 text-[11px]"
+                    onClick={cancelEdit}
+                  >
+                    Annuler
+                  </Button>
+                </div>
+              </div>
+            ) : (
+              <>
+                <p className="flex-1 whitespace-pre-wrap break-words text-xs leading-relaxed text-foreground/80 line-clamp-3">
+                  {m.content}
+                </p>
+                <div className="flex shrink-0 items-center gap-0.5">
+                  <button
+                    onClick={() => startEdit(m)}
+                    title="Modifier"
+                    className="flex h-6 w-6 items-center justify-center rounded hover:bg-secondary"
+                  >
+                    <Pencil className="h-3 w-3 text-muted-foreground" />
+                  </button>
+                  <button
+                    onClick={() => onDelete(m.id)}
+                    title="Supprimer"
+                    className="flex h-6 w-6 items-center justify-center rounded hover:bg-secondary"
+                  >
+                    <X className="h-3 w-3 text-muted-foreground" />
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 export function ChatTab({ project, input, onInputChange, activeWorkspaces, onToggleWorkspace, channel = "chat" }: Props) {
   const wsRef = useRef<WebSocket | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -366,6 +501,10 @@ export function ChatTab({ project, input, onInputChange, activeWorkspaces, onTog
 
   // Model settings (fetched from project)
   const [model, setModel] = useState<string>("");
+  // Modèle réellement résolu par la CLI (alias -> version complète), lu dans l'event system/init.
+  const [resolvedModel, setResolvedModel] = useState<string>("");
+  // Liste des modèles (versions résolues dynamiquement côté serveur).
+  const models = useModels();
   useEffect(() => {
     fetch(`/api/projects/${project.id}`)
       .then((r) => r.json())
@@ -477,8 +616,56 @@ export function ChatTab({ project, input, onInputChange, activeWorkspaces, onTog
     return { perTool, totalCalls, totalConsumed, totalSaved };
   }, [entries]);
 
-  // Message queue — messages typed while agent is working
-  const [messageQueue, setMessageQueue] = useState<string[]>([]);
+  const formatMs = (ms: number | null) => ms === null ? "—" : ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(1)}s`;
+
+  // Message queue — persisted server-side, synced via `queue:state` events.
+  const [messageQueue, setMessageQueue] = useState<QueuedMessage[]>([]);
+
+  // Per-turn latency tracking
+  interface TurnTiming {
+    sentAt: number;
+    firstEventAt?: number;  // first stream event after start (process boot + first API byte)
+    firstTextAt?: number;   // first assistant text delta (TTFT)
+    firstToolAt?: number;   // first tool_use observed
+    doneAt?: number;
+    durationApiMs?: number; // from result.duration_api_ms
+    durationMs?: number;    // from result.duration_ms
+    numTurns?: number;
+  }
+  const [turnTimings, setTurnTimings] = useState<TurnTiming[]>([]);
+  const currentTurnRef = useRef<TurnTiming | null>(null);
+
+  // Latency aggregates
+  const latencyStats = useMemo(() => {
+    if (turnTimings.length === 0) return null;
+    const last = turnTimings[turnTimings.length - 1];
+    const completed = turnTimings.filter((t) => t.doneAt !== undefined);
+    const recent = completed.slice(-5);
+
+    const lastTTFE = last.firstEventAt !== undefined ? last.firstEventAt - last.sentAt : null;
+    const lastTTFT = last.firstTextAt !== undefined ? last.firstTextAt - last.sentAt : null;
+    const lastTTFA = last.firstToolAt !== undefined ? last.firstToolAt - last.sentAt : null;
+    const lastTotal = last.doneAt !== undefined ? last.doneAt - last.sentAt : null;
+    const lastApi = last.durationApiMs ?? null;
+    const lastNumTurns = last.numTurns ?? null;
+
+    const avg = (vals: (number | undefined)[]) => {
+      const xs = vals.filter((v): v is number => typeof v === "number");
+      if (xs.length === 0) return null;
+      return Math.round(xs.reduce((a, b) => a + b, 0) / xs.length);
+    };
+
+    const avgTTFE = avg(recent.map((t) => t.firstEventAt !== undefined ? t.firstEventAt - t.sentAt : undefined));
+    const avgTTFT = avg(recent.map((t) => t.firstTextAt !== undefined ? t.firstTextAt - t.sentAt : undefined));
+    const avgTotal = avg(recent.map((t) => t.doneAt !== undefined ? t.doneAt - t.sentAt : undefined));
+    const avgApi = avg(recent.map((t) => t.durationApiMs));
+
+    return {
+      lastTTFE, lastTTFT, lastTTFA, lastTotal, lastApi, lastNumTurns,
+      avgTTFE, avgTTFT, avgTotal, avgApi,
+      sampleSize: recent.length,
+    };
+  }, [turnTimings]);
 
   // Pasted content — stored separately, shown as badges
   const [pastedBlocks, setPastedBlocks] = useState<{ id: string; content: string; lineCount: number }[]>([]);
@@ -587,28 +774,38 @@ export function ChatTab({ project, input, onInputChange, activeWorkspaces, onTog
     loadOlderRef.current = loadOlder;
   }, [loadOlder]);
 
-  // WebSocket
+  // WebSocket with auto-reconnect (browsers drop WS when tab is backgrounded)
   useEffect(() => {
-    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-    const ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
-    wsRef.current = ws;
+    let cancelled = false;
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    let attempts = 0;
 
-    ws.onopen = () => {
-      setConnected(true);
-      ws.send(
-        JSON.stringify({
-          type: "subscribe",
-          projectId: project.id,
-          projectPath: project.path,
-          channel,
-        })
-      );
-    };
+    const connect = () => {
+      if (cancelled) return;
+      const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+      const ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
+      wsRef.current = ws;
 
-    ws.onclose = () => {
-      setConnected(false);
-      setAgentStatus("idle");
-    };
+      ws.onopen = () => {
+        attempts = 0;
+        setConnected(true);
+        ws.send(
+          JSON.stringify({
+            type: "subscribe",
+            projectId: project.id,
+            projectPath: project.path,
+            channel,
+          })
+        );
+      };
+
+      ws.onclose = () => {
+        setConnected(false);
+        // Don't touch agentStatus — server process likely still running. Reconnect will resync.
+        if (cancelled) return;
+        const delay = Math.min(10000, 500 * Math.pow(2, attempts++));
+        reconnectTimer = setTimeout(connect, delay);
+      };
 
     ws.onmessage = (e) => {
       const msg = JSON.parse(e.data);
@@ -627,6 +824,9 @@ export function ChatTab({ project, input, onInputChange, activeWorkspaces, onTog
         for (const ev of msg.events) {
           if (ev.type === "system" && ev.subtype === "init" && ev.slash_commands) {
             setSlashCommands((prev) => [...new Set([...BUILTIN_COMMANDS, ...ev.slash_commands])]);
+          }
+          if (ev.type === "system" && ev.subtype === "init" && ev.model) {
+            setResolvedModel(ev.model);
           }
           if (ev.type === "result" && ev.usage) {
             stats.inputTokens += ev.usage.input_tokens ?? 0;
@@ -662,15 +862,28 @@ export function ChatTab({ project, input, onInputChange, activeWorkspaces, onTog
       } else if (msg.type === "agent:start") {
         setAgentStatus("waiting");
         setStreamingText("");
+        currentTurnRef.current = { sentAt: Date.now() };
       } else if (msg.type === "agent:snapshot") {
-        // Patch the last user message with the snapshot SHA
+        // Upsert: patch the optimistic user bubble with the snapshot SHA, or —
+        // for a queued message dispatched by the server — append a new bubble.
         setEntries((prev) => {
           const updated = [...prev];
+          let found = false;
           for (let i = updated.length - 1; i >= 0; i--) {
-            if (updated[i].role === "user" && updated[i].content === msg.message) {
+            if (updated[i].role === "user" && updated[i].content === msg.message && !updated[i].snapshotSha) {
               updated[i] = { ...updated[i], snapshotSha: msg.snapshotSha, eventIndex: msg.eventIndex };
+              found = true;
               break;
             }
+          }
+          if (!found) {
+            updated.push({
+              id: crypto.randomUUID(),
+              role: "user",
+              content: msg.message,
+              snapshotSha: msg.snapshotSha,
+              eventIndex: msg.eventIndex,
+            });
           }
           return updated;
         });
@@ -684,8 +897,16 @@ export function ChatTab({ project, input, onInputChange, activeWorkspaces, onTog
 
         const ev = msg.event;
 
+        // Latency markers (first event of the turn = process boot + first API byte arrived)
+        if (currentTurnRef.current && currentTurnRef.current.firstEventAt === undefined) {
+          currentTurnRef.current.firstEventAt = Date.now();
+        }
+
         if (ev.type === "system" && ev.subtype === "init" && ev.slash_commands) {
           setSlashCommands((prev) => [...new Set([...BUILTIN_COMMANDS, ...ev.slash_commands])]);
+        }
+        if (ev.type === "system" && ev.subtype === "init" && ev.model) {
+          setResolvedModel(ev.model);
         }
 
         if (ev.type === "stream_event") {
@@ -693,12 +914,18 @@ export function ChatTab({ project, input, onInputChange, activeWorkspaces, onTog
 
           // Text streaming
           if (inner?.type === "content_block_delta" && inner.delta?.type === "text_delta") {
+            if (currentTurnRef.current && currentTurnRef.current.firstTextAt === undefined) {
+              currentTurnRef.current.firstTextAt = Date.now();
+            }
             setStreamingText((prev) => prev + inner.delta.text);
             setAgentStatus("running");
           }
 
           // Tool use start — flush text, begin tracking tool
           if (inner?.type === "content_block_start" && inner.content_block?.type === "tool_use") {
+            if (currentTurnRef.current && currentTurnRef.current.firstToolAt === undefined) {
+              currentTurnRef.current.firstToolAt = Date.now();
+            }
             // Flush pending text
             setStreamingText((prev) => {
               if (prev.trim()) {
@@ -792,8 +1019,23 @@ export function ChatTab({ project, input, onInputChange, activeWorkspaces, onTog
               turns: prev.turns + 1,
             }));
           }
+
+          // Capture CLI-reported durations from the result event
+          if (currentTurnRef.current) {
+            currentTurnRef.current.durationApiMs = ev.duration_api_ms;
+            currentTurnRef.current.durationMs = ev.duration_ms;
+            currentTurnRef.current.numTurns = ev.num_turns;
+          }
         }
       } else if (msg.type === "agent:done") {
+        // Finalize turn timing
+        if (currentTurnRef.current) {
+          currentTurnRef.current.doneAt = Date.now();
+          const finalized = currentTurnRef.current;
+          setTurnTimings((prev) => [...prev, finalized].slice(-20));
+          currentTurnRef.current = null;
+        }
+
         setStreamingText((prev) => {
           if (prev.trim()) {
             setEntries((e) => [
@@ -804,40 +1046,21 @@ export function ChatTab({ project, input, onInputChange, activeWorkspaces, onTog
           return "";
         });
 
-        // Desktop notification
-        if (document.hidden && Notification.permission === "granted") {
-          new Notification(`Overlord — ${project.name}`, {
-            body: "Claude a termine son travail.",
-            icon: "/favicon.ico",
-          });
-        }
-
-        // Process message queue — send next queued message
-        setMessageQueue((queue) => {
-          if (queue.length > 0 && ws.readyState === WebSocket.OPEN) {
-            const [next, ...rest] = queue;
-            // Send after a small delay so state settles
-            setTimeout(() => {
-              setAgentStatus("waiting");
-              setEntries((prev) => [
-                ...prev,
-                { id: crypto.randomUUID(), role: "user", content: next },
-              ]);
-              ws.send(
-                JSON.stringify({
-                  type: "chat",
-                  projectId: project.id,
-                  projectPath: project.path,
-                  message: next,
-                  channel,
-                })
-              );
-            }, 500);
-            return rest;
-          }
+        // The server drains the queue itself; `willContinue` means another
+        // turn is about to start, so stay busy and skip the "done" notification.
+        if (!msg.willContinue) {
           setAgentStatus("idle");
-          return queue;
-        });
+          if (document.hidden && Notification.permission === "granted") {
+            new Notification(`Overlord — ${project.name}`, {
+              body: "Claude a termine son travail.",
+              icon: "/favicon.ico",
+            });
+          }
+        }
+      } else if (msg.type === "queue:state") {
+        if (!msg.channel || msg.channel === channel) {
+          setMessageQueue(msg.queue ?? []);
+        }
       } else if (msg.type === "learnings:generating" && msg.projectId === project.id) {
         setLearningsStatus("generating");
       } else if (msg.type === "learnings:done" && msg.projectId === project.id) {
@@ -845,7 +1068,15 @@ export function ChatTab({ project, input, onInputChange, activeWorkspaces, onTog
       }
     };
 
-    return () => ws.close();
+    };  // end of connect()
+
+    connect();
+
+    return () => {
+      cancelled = true;
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      wsRef.current?.close();
+    };
   }, [project.id, project.path, channel]);
 
   const handleSend = useCallback(() => {
@@ -901,9 +1132,18 @@ export function ChatTab({ project, input, onInputChange, activeWorkspaces, onTog
       Notification.requestPermission();
     }
 
-    // If agent is working, queue the message
-    if (agentStatus !== "idle") {
-      setMessageQueue((prev) => [...prev, fullMessage]);
+    // Send immediately only when the agent is idle AND the queue is empty —
+    // otherwise append to the persistent server-side queue to preserve order.
+    if (agentStatus !== "idle" || messageQueue.length > 0) {
+      wsRef.current.send(
+        JSON.stringify({
+          type: "queue:add",
+          projectId: project.id,
+          projectPath: project.path,
+          content: fullMessage,
+          channel,
+        })
+      );
       return;
     }
 
@@ -929,21 +1169,30 @@ export function ChatTab({ project, input, onInputChange, activeWorkspaces, onTog
         channel,
       })
     );
-  }, [input, pastedBlocks, fileBlocks, project, onInputChange, agentStatus, channel, activeWorkspaces]);
+  }, [input, pastedBlocks, fileBlocks, project, onInputChange, agentStatus, channel, activeWorkspaces, messageQueue]);
 
   const handleAnswerQuestions = useCallback((answer: string) => {
     if (!wsRef.current) return;
+
+    // Queue the answer if the agent is still busy or messages are pending.
+    if (agentStatus !== "idle" || messageQueue.length > 0) {
+      wsRef.current.send(
+        JSON.stringify({
+          type: "queue:add",
+          projectId: project.id,
+          projectPath: project.path,
+          content: answer,
+          channel,
+        })
+      );
+      return;
+    }
 
     setAgentStatus("waiting");
     setEntries((prev) => [
       ...prev,
       { id: crypto.randomUUID(), role: "user", content: answer },
     ]);
-
-    if (agentStatus !== "idle") {
-      setMessageQueue((prev) => [...prev, answer]);
-      return;
-    }
 
     wsRef.current.send(
       JSON.stringify({
@@ -954,7 +1203,7 @@ export function ChatTab({ project, input, onInputChange, activeWorkspaces, onTog
         channel,
       })
     );
-  }, [project, agentStatus, channel]);
+  }, [project, agentStatus, channel, messageQueue]);
 
   const handleStop = useCallback(() => {
     if (!wsRef.current) return;
@@ -962,6 +1211,28 @@ export function ChatTab({ project, input, onInputChange, activeWorkspaces, onTog
       JSON.stringify({ type: "stop", projectId: project.id, channel })
     );
   }, [project.id, channel]);
+
+  // Queue management — all mutations go through the server (source of truth).
+  const sendWs = useCallback((obj: object) => {
+    const ws = wsRef.current;
+    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+  }, []);
+
+  const handleQueueEdit = useCallback((id: number, content: string) => {
+    sendWs({ type: "queue:update", projectId: project.id, channel, id, content });
+  }, [sendWs, project.id, channel]);
+
+  const handleQueueDelete = useCallback((id: number) => {
+    sendWs({ type: "queue:delete", projectId: project.id, channel, id });
+  }, [sendWs, project.id, channel]);
+
+  const handleQueueClear = useCallback(() => {
+    sendWs({ type: "queue:clear", projectId: project.id, channel });
+  }, [sendWs, project.id, channel]);
+
+  const handleQueueRun = useCallback(() => {
+    sendWs({ type: "queue:run", projectId: project.id, projectPath: project.path, channel });
+  }, [sendWs, project.id, project.path, channel]);
 
   const selectSlashCommand = useCallback(
     (cmd: string) => {
@@ -1065,14 +1336,18 @@ export function ChatTab({ project, input, onInputChange, activeWorkspaces, onTog
             title="Claude model for this project"
             disabled={isWorking}
           >
-            <option value="">Default</option>
-            <option value="claude-opus-4-7">Opus 4.7</option>
-            <option value="claude-opus-4-6[1m]">Opus 4.6 (1M)</option>
-            <option value="claude-opus-4-6">Opus 4.6</option>
-            <option value="claude-sonnet-4-6[1m]">Sonnet 4.6 (1M)</option>
-            <option value="claude-sonnet-4-6">Sonnet 4.6</option>
-            <option value="claude-haiku-4-5-20251001">Haiku 4.5</option>
+            {models.map((m) => (
+              <option key={m.id} value={m.id}>{m.short}</option>
+            ))}
           </select>
+          {resolvedModel && (
+            <span
+              className="hidden lg:inline text-[10px] text-muted-foreground font-mono"
+              title={`Modèle résolu par la CLI : ${resolvedModel}`}
+            >
+              → {formatModelVersion(resolvedModel)}
+            </span>
+          )}
           {tokenStats.turns > 0 && (
             <Tooltip>
               <TooltipTrigger>
@@ -1098,6 +1373,11 @@ export function ChatTab({ project, input, onInputChange, activeWorkspaces, onTog
                       codegraphStats.totalCalls > 0 ? "text-cyan-400" : "text-muted-foreground/60"
                     )}>
                       CG {codegraphStats.totalCalls}×{codegraphStats.totalCalls > 0 ? ` ~${formatTokens(codegraphStats.totalSaved)}` : ""}
+                    </span>
+                  )}
+                  {latencyStats && latencyStats.lastTTFT !== null && (
+                    <span className="text-amber-400/80">
+                      TTFT {formatMs(latencyStats.lastTTFT)}
                     </span>
                   )}
                 </div>
@@ -1134,6 +1414,37 @@ export function ChatTab({ project, input, onInputChange, activeWorkspaces, onTog
                           MCP active mais Claude ne l'a pas appele. Mentionne-le dans ton message ("utilise codegraph...") ou ajoute une nudge dans le system prompt projet.
                         </p>
                       )}
+                    </div>
+                  )}
+                  {latencyStats && (
+                    <div className="border-t border-border/50 pt-1.5 mt-1.5">
+                      <p><strong className="text-amber-400">Latence (dernier turn)</strong></p>
+                      <table className="text-[10px] font-mono mt-1 w-full">
+                        <tbody>
+                          <tr><td className="text-muted-foreground pr-2">TTFE (1er event)</td><td>{formatMs(latencyStats.lastTTFE)}</td></tr>
+                          <tr><td className="text-muted-foreground pr-2">TTFT (1er texte)</td><td>{formatMs(latencyStats.lastTTFT)}</td></tr>
+                          <tr><td className="text-muted-foreground pr-2">TTFA (1er tool)</td><td>{formatMs(latencyStats.lastTTFA)}</td></tr>
+                          <tr><td className="text-muted-foreground pr-2">API time</td><td>{formatMs(latencyStats.lastApi)}</td></tr>
+                          <tr><td className="text-muted-foreground pr-2">Total wall</td><td>{formatMs(latencyStats.lastTotal)}</td></tr>
+                          <tr><td className="text-muted-foreground pr-2">Model turns</td><td>{latencyStats.lastNumTurns ?? "—"}</td></tr>
+                        </tbody>
+                      </table>
+                      {latencyStats.sampleSize > 1 && (
+                        <>
+                          <p className="mt-1.5"><strong className="text-amber-400/70">Moyenne (derniers {latencyStats.sampleSize})</strong></p>
+                          <table className="text-[10px] font-mono mt-1 w-full">
+                            <tbody>
+                              <tr><td className="text-muted-foreground pr-2">TTFE</td><td>{formatMs(latencyStats.avgTTFE)}</td></tr>
+                              <tr><td className="text-muted-foreground pr-2">TTFT</td><td>{formatMs(latencyStats.avgTTFT)}</td></tr>
+                              <tr><td className="text-muted-foreground pr-2">API</td><td>{formatMs(latencyStats.avgApi)}</td></tr>
+                              <tr><td className="text-muted-foreground pr-2">Total</td><td>{formatMs(latencyStats.avgTotal)}</td></tr>
+                            </tbody>
+                          </table>
+                        </>
+                      )}
+                      <p className="text-[10px] italic opacity-60 mt-1">
+                        TTFE = boot CLI + handshake MCP + 1er byte API. TTFT &gt; TTFE = pure latence Anthropic. Si TTFE croit, c'est notre overhead (MCP, spawn).
+                      </p>
                     </div>
                   )}
                 </div>
@@ -1268,7 +1579,7 @@ export function ChatTab({ project, input, onInputChange, activeWorkspaces, onTog
 
       {/* Workspace scope selector */}
       {workspacePackages.length > 0 && (
-        <div className="flex items-center gap-1.5 border-t border-border px-5 py-1.5 overflow-x-auto scrollbar-visible">
+        <div className="relative z-10 flex items-center gap-1.5 border-t border-border bg-card px-5 py-1.5 overflow-x-auto scrollbar-visible">
           <span className="text-[10px] text-muted-foreground shrink-0 mr-1">Scope:</span>
           {workspacePackages.map((pkg) => (
             <button
@@ -1339,21 +1650,15 @@ export function ChatTab({ project, input, onInputChange, activeWorkspaces, onTog
           </div>
         )}
 
-        {/* Queued messages indicator */}
-        {messageQueue.length > 0 && (
-          <div className="mb-2 flex items-center gap-2 text-xs text-muted-foreground">
-            <span className="flex h-5 min-w-5 items-center justify-center rounded-full bg-primary/20 px-1.5 text-[10px] font-bold text-primary">
-              {messageQueue.length}
-            </span>
-            <span>message{messageQueue.length > 1 ? "s" : ""} en attente</span>
-            <button
-              onClick={() => setMessageQueue([])}
-              className="ml-auto text-[10px] text-muted-foreground hover:text-destructive"
-            >
-              Vider la file
-            </button>
-          </div>
-        )}
+        {/* Queued messages — persisted, editable, deletable */}
+        <QueuePanel
+          queue={messageQueue}
+          agentIdle={agentStatus === "idle"}
+          onEdit={handleQueueEdit}
+          onDelete={handleQueueDelete}
+          onClear={handleQueueClear}
+          onRun={handleQueueRun}
+        />
 
         <div
           className="flex items-stretch gap-2"
@@ -1393,6 +1698,8 @@ export function ChatTab({ project, input, onInputChange, activeWorkspaces, onTog
               setFileBlocks((prev) => prev.filter((f) => f.id !== id));
               fetch(`/api/uploads/${id}?projectId=${project.id}`, { method: "DELETE" }).catch(() => {});
             }}
+            enableSpeech
+            speechLang="fr-FR"
             placeholder={
               isWorking
                 ? `Taper un message (sera envoye quand Claude aura fini)...`
@@ -1416,9 +1723,11 @@ export function ChatTab({ project, input, onInputChange, activeWorkspaces, onTog
             <Button
               onClick={handleSend}
               disabled={!connected || (!input.trim() && pastedBlocks.length === 0 && fileBlocks.length === 0)}
-              variant={isWorking ? "secondary" : "default"}
+              variant={isWorking || messageQueue.length > 0 ? "secondary" : "default"}
             >
-              {isWorking ? `En file (${messageQueue.length + 1})` : "Envoyer"}
+              {isWorking || messageQueue.length > 0
+                ? `En file (${messageQueue.length + 1})`
+                : "Envoyer"}
             </Button>
           </div>
         </div>

@@ -19,6 +19,7 @@ import skillsRoutes from "./routes/skills.js";
 import learningsRoutes from "./routes/learnings.js";
 import codegraphRoutes from "./routes/codegraph.js";
 import uploadsRoutes from "./routes/uploads.js";
+import insightsRoutes from "./routes/insights.js";
 
 import { setWebSocketServer } from "./ws.js";
 import { attachWsHandlers } from "./agent/ws-handler.js";
@@ -48,6 +49,7 @@ app.route("/api/skills", skillsRoutes);
 app.route("/api/learnings", learningsRoutes);
 app.route("/api/codegraph", codegraphRoutes);
 app.route("/api/uploads", uploadsRoutes);
+app.route("/api/insights", insightsRoutes);
 
 app.post("/api/terminal/open", async (c) => {
   const body = await c.req.json();
@@ -121,6 +123,95 @@ app.get("/api/rtk/gain/:projectId", (c) => {
   } catch {
     return c.json({ summary: null });
   }
+});
+
+// --- Résolution dynamique des versions de modèles (alias -> ID versionné) ---
+// On lance la CLI avec un alias et on lit le 1er event `system/init` (émis au
+// démarrage, AVANT toute inférence), puis on tue le process. C'est quasi gratuit
+// et ne requiert aucune clé API : on s'appuie sur l'auth de la CLI Claude.
+interface ResolvedModelOption { id: string; label: string; short: string; version: string | null; }
+
+// opus/sonnet supportent le contexte 1M, pas haiku.
+const MODEL_ALIASES = [
+  { alias: "opus", oneM: true },
+  { alias: "sonnet", oneM: true },
+  { alias: "haiku", oneM: false },
+];
+const MODEL_CACHE_TTL = 60 * 60 * 1000; // 1h
+let modelCache: { at: number; models: ResolvedModelOption[] } | null = null;
+
+function resolveAlias(alias: string): Promise<string | null> {
+  return new Promise((resolveP) => {
+    const proc = spawn(
+      CLAUDE_PATH,
+      ["--model", alias, "--print", "--output-format", "stream-json", "--verbose", "hi"],
+      { env: { ...process.env }, stdio: ["ignore", "pipe", "pipe"] },
+    );
+    let buf = "";
+    let done = false;
+    const finish = (val: string | null) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      try { proc.kill("SIGTERM"); } catch {}
+      resolveP(val);
+    };
+    const timer = setTimeout(() => finish(null), 20000);
+    proc.stdout!.on("data", (d: Buffer) => {
+      buf += d.toString();
+      let nl: number;
+      while ((nl = buf.indexOf("\n")) !== -1) {
+        const line = buf.slice(0, nl);
+        buf = buf.slice(nl + 1);
+        try {
+          const ev = JSON.parse(line);
+          if (ev.type === "system" && ev.subtype === "init" && ev.model) {
+            finish(ev.model);
+            return;
+          }
+        } catch {}
+      }
+    });
+    proc.on("error", () => finish(null));
+    proc.on("close", () => finish(null));
+  });
+}
+
+function formatModelVersion(id: string): string {
+  const m = id.match(/claude-(opus|sonnet|haiku)-(\d+)-(\d+)/i);
+  if (m) return `${m[1][0].toUpperCase()}${m[1].slice(1)} ${m[2]}.${m[3]}`;
+  return id.replace(/^claude-/, "");
+}
+
+app.get("/api/models", async (c) => {
+  if (modelCache && Date.now() - modelCache.at < MODEL_CACHE_TTL) {
+    return c.json(modelCache.models);
+  }
+
+  const resolved = await Promise.all(
+    MODEL_ALIASES.map(async (spec) => ({ ...spec, id: await resolveAlias(spec.alias) })),
+  );
+
+  const models: ResolvedModelOption[] = [
+    { id: "", label: "Default (Claude CLI default)", short: "Default", version: null },
+  ];
+  for (const r of resolved) {
+    const ver = r.id ? formatModelVersion(r.id) : r.alias[0].toUpperCase() + r.alias.slice(1);
+    models.push({ id: r.alias, label: `Claude ${ver}`, short: ver, version: r.id });
+    if (r.oneM) {
+      models.push({
+        id: `${r.alias}[1m]`,
+        label: `Claude ${ver} (1M context)`,
+        short: `${ver} 1M`,
+        version: r.id ? `${r.id}[1m]` : null,
+      });
+    }
+  }
+
+  // On ne met en cache qu'un résultat où au moins un alias a été résolu, pour
+  // éviter de figer un échec transitoire (CLI absente, offline...).
+  if (resolved.some((r) => r.id)) modelCache = { at: Date.now(), models };
+  return c.json(models);
 });
 
 app.post("/api/agent/ask", async (c) => {

@@ -131,3 +131,17 @@ export const todos = sqliteTable("todos", {
     .notNull()
     .$defaultFn(() => new Date().toISOString()),
 });
+
+// Messages typed while the agent is busy — persisted so they survive
+// reloads, app kills, and WebSocket reconnects. Drained server-side.
+export const queuedMessages = sqliteTable("queued_messages", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  projectId: integer("project_id")
+    .notNull()
+    .references(() => projects.id),
+  channel: text("channel").notNull().default("chat"),
+  content: text("content").notNull(),
+  createdAt: text("created_at")
+    .notNull()
+    .$defaultFn(() => new Date().toISOString()),
+});
