@@ -14,6 +14,7 @@ import { DEFAULT_ALLOWED_TOOLS } from "./default-tools.js";
 import { generateSummary } from "./summary.js";
 import { generateLearnings } from "./learnings.js";
 import { isIndexed as isCodegraphIndexed, runCodegraph, CODEGRAPH_BIN } from "../routes/codegraph.js";
+import { isCodeChannel, isSubChannel } from "./types.js";
 import type { AgentSession } from "./types.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -63,7 +64,7 @@ export function sendMessage(session: AgentSession, message: string) {
     },
   };
 
-  if (session.channel === "chat" && isCodegraphIndexed(session.projectPath)) {
+  if (isCodeChannel(session.channel) && isCodegraphIndexed(session.projectPath)) {
     mcpServers.codegraph = {
       command: CODEGRAPH_BIN,
       args: ["serve", "--mcp", "-p", session.projectPath],
@@ -74,9 +75,23 @@ export function sendMessage(session: AgentSession, message: string) {
 
   const project = db.select().from(projects).where(eq(projects.id, session.projectId)).get();
 
-  const codegraphActive = session.channel === "chat" && isCodegraphIndexed(session.projectPath);
+  const codegraphActive = isCodeChannel(session.channel) && isCodegraphIndexed(session.projectPath);
 
-  const { full: systemPrompt } = buildEffectiveSystemPrompt(project, session.channel, session.projectPath);
+  let { full: systemPrompt } = buildEffectiveSystemPrompt(project, session.channel, session.projectPath);
+
+  // Sub-conversations inherit an excerpt of their parent conversation as
+  // background context, injected into the system prompt so the branch starts
+  // "clean" (no visible messages) yet aware of what it was spun off from.
+  if (isSubChannel(session.channel)) {
+    const conv = db.select().from(conversations).where(eq(conversations.id, session.conversationId)).get();
+    if (conv?.contextText) {
+      systemPrompt +=
+        `\n\n[BRANCHED CONVERSATION CONTEXT]\n` +
+        `This is a focused side-conversation branched from the main chat. Below is the relevant excerpt from that conversation for context. Treat it as background; the user will now ask you something specific about it.\n\n` +
+        conv.contextText +
+        `\n[/BRANCHED CONVERSATION CONTEXT]`;
+    }
+  }
 
   const model = project?.model;
 
@@ -139,7 +154,16 @@ export function sendMessage(session: AgentSession, message: string) {
   session.currentProcess = proc;
   session.status = "running";
   broadcast(session, { type: "agent:running" });
-  broadcastAll({ type: "agent:status_change", projectId: session.projectId, status: "running" });
+  if (isSubChannel(session.channel)) {
+    broadcastAll({
+      type: "subchat:update",
+      projectId: session.projectId,
+      conversationId: session.conversationId,
+      status: "running",
+    });
+  } else {
+    broadcastAll({ type: "agent:status_change", projectId: session.projectId, status: "running" });
+  }
 
   let buffer = "";
   proc.stdout!.on("data", (data: Buffer) => {
@@ -201,7 +225,16 @@ export function sendMessage(session: AgentSession, message: string) {
     session.status = "idle";
     broadcast(session, { type: "agent:raw", data: `Claude failed to start: ${err.message}` });
     broadcast(session, { type: "agent:done", code: 1 });
-    broadcastAll({ type: "agent:status_change", projectId: session.projectId, status: "error" });
+    if (isSubChannel(session.channel)) {
+      broadcastAll({
+        type: "subchat:update",
+        projectId: session.projectId,
+        conversationId: session.conversationId,
+        status: "error",
+      });
+    } else {
+      broadcastAll({ type: "agent:status_change", projectId: session.projectId, status: "error" });
+    }
   });
 
   proc.on("close", (code) => {
@@ -223,7 +256,26 @@ export function sendMessage(session: AgentSession, message: string) {
 
     broadcast(session, { type: "agent:done", code, willContinue: !!next });
     const finalStatus = code === 0 ? "done" : "error";
-    broadcastAll({ type: "agent:status_change", projectId: session.projectId, status: finalStatus });
+
+    if (isSubChannel(session.channel)) {
+      // Mark unread only when the branch has actually settled (no queued
+      // continuation left), so the notification reflects a finished turn.
+      if (!next) {
+        db.update(conversations)
+          .set({ unread: true })
+          .where(eq(conversations.id, session.conversationId))
+          .run();
+      }
+      broadcastAll({
+        type: "subchat:update",
+        projectId: session.projectId,
+        conversationId: session.conversationId,
+        status: next ? "running" : finalStatus,
+        unread: !next,
+      });
+    } else {
+      broadcastAll({ type: "agent:status_change", projectId: session.projectId, status: finalStatus });
+    }
 
     if (next) {
       console.log(`[agent:${session.projectId}] draining queued message`);
@@ -231,7 +283,9 @@ export function sendMessage(session: AgentSession, message: string) {
       return;
     }
 
-    if (code === 0) {
+    // Branches are ephemeral side-conversations: never let them overwrite the
+    // project summary or spawn learnings the way the main chat does.
+    if (code === 0 && !isSubChannel(session.channel)) {
       generateSummary(session);
       if (session.channel === "chat" && isCodegraphIndexed(session.projectPath)) {
         runCodegraph(["sync", session.projectPath], session.projectPath, 60000).catch(() => {});

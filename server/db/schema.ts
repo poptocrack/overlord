@@ -47,6 +47,14 @@ export const conversations = sqliteTable("conversations", {
   channel: text("channel").notNull().default("chat"),
   claudeSessionId: text("claude_session_id"),
   title: text("title"),
+  // Sub-conversations ("branches"): a fresh chat spun off from a message in the
+  // main chat. `parentConversationId` links back to the source conversation,
+  // `contextText` holds the excerpt injected into the agent's system prompt so
+  // it inherits context without polluting the visible message list, and
+  // `unread` drives the notification indicator on the Conversations tab.
+  parentConversationId: integer("parent_conversation_id"),
+  contextText: text("context_text"),
+  unread: integer("unread", { mode: "boolean" }).notNull().default(false),
   createdAt: text("created_at")
     .notNull()
     .$defaultFn(() => new Date().toISOString()),

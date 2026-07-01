@@ -1,5 +1,6 @@
 import { isIndexed as isCodegraphIndexed } from "../routes/codegraph.js";
 import { buildMarketingSystemPrompt } from "./marketing-prompt.js";
+import { isCodeChannel } from "./types.js";
 import type { Channel } from "./types.js";
 
 export const DEFAULT_CHAT_PROMPT = "Match the language of the user's message in your response. When you respond in French, always use proper French accents.";
@@ -51,7 +52,7 @@ export function buildEffectiveSystemPrompt(
     reason: "Overlord runs the agent headless — no interactive permission prompts",
   });
 
-  if (channel === "chat" && isCodegraphIndexed(projectPath)) {
+  if (isCodeChannel(channel) && isCodegraphIndexed(projectPath)) {
     nudges.push({
       name: "Codegraph",
       content: CODEGRAPH_NUDGE,

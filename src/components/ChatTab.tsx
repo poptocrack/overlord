@@ -2,7 +2,7 @@ import React, { useEffect, useRef, useState, useCallback, useMemo } from "react"
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { cn } from "@/lib/utils";
-import { Square, Copy, Check, ArrowDown, Undo2, Plus, SendHorizontal, Pencil, X } from "lucide-react";
+import { Square, Copy, Check, ArrowDown, Undo2, Plus, SendHorizontal, Pencil, X, GitBranch } from "lucide-react";
 import { Tooltip, TooltipTrigger, TooltipContent } from "@/components/ui/tooltip";
 import { MarkdownContent } from "./MarkdownContent.js";
 import { ToolUseCard } from "./ToolUseCard.js";
@@ -107,7 +107,11 @@ interface Props {
   onInputChange: (value: string) => void;
   activeWorkspaces: string[];
   onToggleWorkspace: (path: string) => void;
-  channel?: "chat" | "marketing";
+  // Any channel string is valid — sub-conversations use `sub:<conversationId>`.
+  channel?: string;
+  // When provided, each message shows a "branch" button that spins off a new
+  // sub-conversation seeded with an excerpt ending at that message.
+  onCreateBranch?: (payload: { contextText: string; title: string }) => void;
 }
 
 // Extract readable chat entries from Claude stream-json events
@@ -278,14 +282,37 @@ function AddToTodoButton({ content, projectId }: { content: string; projectId: n
   );
 }
 
+// Always-visible "branch" affordance: opens a fresh sub-conversation seeded
+// with the context ending at this message.
+function BranchButton({ onBranch }: { onBranch: () => void }) {
+  return (
+    <Tooltip>
+      <TooltipTrigger>
+        <span
+          role="button"
+          onClick={onBranch}
+          className="flex h-6 w-6 items-center justify-center rounded-md text-muted-foreground/60 transition-colors hover:bg-secondary hover:text-primary cursor-pointer"
+        >
+          <GitBranch className="h-3 w-3" />
+        </span>
+      </TooltipTrigger>
+      <TooltipContent side="left" className="text-xs">
+        Open a branch conversation from here
+      </TooltipContent>
+    </Tooltip>
+  );
+}
+
 const UserMessage = React.memo(function UserMessage({
   entry,
   projectId,
   onRollback,
+  onBranch,
 }: {
   entry: ChatEntry;
   projectId: number;
   onRollback: (content: string) => void;
+  onBranch?: () => void;
 }) {
   const [rolling, setRolling] = useState(false);
   const [confirmNeeded, setConfirmNeeded] = useState<string | null>(null);
@@ -353,8 +380,15 @@ const UserMessage = React.memo(function UserMessage({
             <Undo2 className="h-3.5 w-3.5 text-muted-foreground" />
           </button>
         )}
-        <div className="mb-1.5 text-[10px] font-semibold uppercase tracking-wider opacity-50">
-          You
+        <div className="mb-1.5 flex items-center justify-between gap-2">
+          <span className="text-[10px] font-semibold uppercase tracking-wider opacity-50">
+            You
+          </span>
+          {onBranch && (
+            <span className="-mr-1 -mt-1 text-primary-foreground/70">
+              <BranchButton onBranch={onBranch} />
+            </span>
+          )}
         </div>
         <div className="text-sm leading-relaxed select-text">
           {entry.displayContent ? (
@@ -377,7 +411,7 @@ const UserMessage = React.memo(function UserMessage({
   );
 });
 
-const MessageBubble = React.memo(function MessageBubble({ content, projectId }: { content: string; projectId: number }) {
+const MessageBubble = React.memo(function MessageBubble({ content, projectId, onBranch }: { content: string; projectId: number; onBranch?: () => void }) {
   const [copied, setCopied] = useState(false);
 
   const handleCopy = useCallback(() => {
@@ -393,6 +427,7 @@ const MessageBubble = React.memo(function MessageBubble({ content, projectId }: 
           Claude
         </span>
         <div className="flex items-center gap-0.5">
+          {onBranch && <BranchButton onBranch={onBranch} />}
           <AddToTodoButton content={content} projectId={projectId} />
           <Tooltip>
             <TooltipTrigger>
@@ -547,7 +582,7 @@ function QueuePanel({
   );
 }
 
-export function ChatTab({ project, input, onInputChange, activeWorkspaces, onToggleWorkspace, channel = "chat" }: Props) {
+export function ChatTab({ project, input, onInputChange, activeWorkspaces, onToggleWorkspace, channel = "chat", onCreateBranch }: Props) {
   const wsRef = useRef<WebSocket | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<RichPasteInputHandle>(null);
@@ -1390,6 +1425,36 @@ export function ChatTab({ project, input, onInputChange, activeWorkspaces, onTog
     );
   }, [project.id, channel]);
 
+  // Build the seed context for a branch: up to the last 10 user/assistant
+  // messages ending at the clicked one, formatted as a readable transcript.
+  const handleBranch = useCallback(
+    (entry: ChatEntry) => {
+      if (!onCreateBranch) return;
+      const idx = entries.findIndex((e) => e.id === entry.id);
+      if (idx < 0) return;
+
+      const collected: ChatEntry[] = [];
+      for (let i = idx; i >= 0 && collected.length < 10; i--) {
+        if (entries[i].role === "tool") continue;
+        collected.unshift(entries[i]);
+      }
+
+      const contextText = collected
+        .map((e) => {
+          const who = e.role === "user" ? "You" : "Claude";
+          const text = (e.displayContent || e.content || "").trim();
+          return text ? `${who}: ${text}` : "";
+        })
+        .filter(Boolean)
+        .join("\n\n");
+
+      const clickedText = (entry.displayContent || entry.content || "").trim();
+      const title = clickedText.split("\n")[0].slice(0, 60) || "Branch";
+      onCreateBranch({ contextText, title });
+    },
+    [entries, onCreateBranch]
+  );
+
   // Queue management: all mutations go through the server as the source of truth.
   const sendWs = useCallback((obj: object) => {
     const ws = wsRef.current;
@@ -1695,6 +1760,7 @@ export function ChatTab({ project, input, onInputChange, activeWorkspaces, onTog
               key={entry.id}
               entry={entry}
               projectId={project.id}
+              onBranch={onCreateBranch ? () => handleBranch(entry) : undefined}
               onRollback={(content) => {
                 onInputChange(content);
                 // Remove this message and everything after from entries
@@ -1705,7 +1771,12 @@ export function ChatTab({ project, input, onInputChange, activeWorkspaces, onTog
               }}
             />
           ) : (
-            <MessageBubble key={entry.id} content={entry.content} projectId={project.id} />
+            <MessageBubble
+              key={entry.id}
+              content={entry.content}
+              projectId={project.id}
+              onBranch={onCreateBranch ? () => handleBranch(entry) : undefined}
+            />
           )
         )}
 

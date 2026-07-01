@@ -65,24 +65,31 @@ export function loadSessionFromDb(projectId: number, projectPath: string, channe
     .limit(1)
     .get();
 
-  if (!conv || !conv.eventsJson) return null;
+  // Bind to the existing conversation row even when it has no events yet:
+  // sub-conversations ("branches") are created up-front (empty) and their first
+  // message must attach to that exact row, not spawn a duplicate.
+  if (!conv) return null;
 
-  try {
-    const events = JSON.parse(conv.eventsJson);
-    return {
-      projectId,
-      projectPath,
-      channel,
-      conversationId: conv.id,
-      claudeSessionId: conv.claudeSessionId,
-      events,
-      currentProcess: null,
-      status: "idle",
-      subscribers: new Set(),
-    };
-  } catch {
-    return null;
+  let events: object[] = [];
+  if (conv.eventsJson) {
+    try {
+      events = JSON.parse(conv.eventsJson);
+    } catch {
+      events = [];
+    }
   }
+
+  return {
+    projectId,
+    projectPath,
+    channel,
+    conversationId: conv.id,
+    claudeSessionId: conv.claudeSessionId,
+    events,
+    currentProcess: null,
+    status: "idle",
+    subscribers: new Set(),
+  };
 }
 
 export function getOrCreateSession(projectId: number, projectPath: string, channel: Channel): AgentSession {
