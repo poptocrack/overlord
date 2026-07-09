@@ -68,6 +68,15 @@ export function initDb() {
   if (!convCols.some((c) => c.name === "channel")) {
     sqlite.exec("ALTER TABLE conversations ADD COLUMN channel TEXT NOT NULL DEFAULT 'chat'");
   }
+  if (!convCols.some((c) => c.name === "parent_conversation_id")) {
+    sqlite.exec("ALTER TABLE conversations ADD COLUMN parent_conversation_id INTEGER");
+  }
+  if (!convCols.some((c) => c.name === "context_text")) {
+    sqlite.exec("ALTER TABLE conversations ADD COLUMN context_text TEXT");
+  }
+  if (!convCols.some((c) => c.name === "unread")) {
+    sqlite.exec("ALTER TABLE conversations ADD COLUMN unread INTEGER NOT NULL DEFAULT 0");
+  }
 
   const projCols = sqlite.pragma("table_info(projects)") as { name: string }[];
   if (!projCols.some((c) => c.name === "favorite")) {

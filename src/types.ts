@@ -37,6 +37,21 @@ export interface Conversation {
   lastResumedAt: string | null;
 }
 
+// A branch spun off from a message in the main chat. Returned by
+// GET /api/conversations/sub/:projectId with live status merged in.
+export interface SubConversation {
+  id: number;
+  projectId: number;
+  title: string | null;
+  contextText: string | null;
+  parentConversationId: number | null;
+  createdAt: string;
+  unread: boolean;
+  running: boolean;
+  hasEvents: boolean;
+  preview: string;
+}
+
 export interface WorkspaceInfo {
   type: "pnpm" | "yarn" | "npm" | "nx" | "lerna" | null;
   packages: WorkspacePackage[];

@@ -1,9 +1,11 @@
 import { useState, useCallback, useEffect, useRef } from "react";
-import type { Project } from "./types.js";
+import type { Project, SubConversation } from "./types.js";
 import { useApi, post } from "./hooks/useApi.js";
 import { ProjectSidebar } from "./components/Sidebar.js";
 import { SummaryTab } from "./components/SummaryTab.js";
 import { ChatTab } from "./components/ChatTab.js";
+import { ConversationsTab } from "./components/ConversationsTab.js";
+import { SubConversationModal } from "./components/SubConversationModal.js";
 import { SettingsTab } from "./components/SettingsTab.js";
 import { MarketingTab } from "./components/MarketingTab.js";
 import { SkillsTab } from "./components/SkillsTab.js";
@@ -27,11 +29,12 @@ type WorkspaceSettings = {
   source: "user" | "env" | "default";
 };
 
-const VISIBLE_TABS = ["chat", "todos", "marketing", "skills", "summary", "insights", "settings"] as const;
+const VISIBLE_TABS = ["chat", "conversations", "todos", "marketing", "skills", "summary", "insights", "settings"] as const;
 type VisibleTab = typeof VISIBLE_TABS[number];
 
 const TAB_LABELS: Record<VisibleTab, string> = {
   chat: "Chat",
+  conversations: "Conversations",
   todos: "Todos",
   marketing: "Marketing",
   skills: "Skills",
@@ -94,6 +97,82 @@ export function App() {
     } catch { return {}; }
   });
   const statusWsRef = useRef<WebSocket | null>(null);
+
+  // Sub-conversations ("branches") for the selected project + the one shown in
+  // the modal. Kept at the top level so the modal survives tab switches and a
+  // busy branch keeps running while the user navigates elsewhere.
+  const [subConvs, setSubConvs] = useState<SubConversation[]>([]);
+  const [openSubConv, setOpenSubConv] = useState<SubConversation | null>(null);
+  const selectedRef = useRef<Project | null>(null);
+  const openSubConvRef = useRef<SubConversation | null>(null);
+
+  const refreshSubConvs = useCallback(() => {
+    const proj = selectedRef.current;
+    if (!proj) { setSubConvs([]); return; }
+    fetch(`/api/conversations/sub/${proj.id}`)
+      .then((r) => r.json())
+      .then((d) => setSubConvs(Array.isArray(d) ? d : []))
+      .catch(() => {});
+  }, []);
+
+  useEffect(() => { openSubConvRef.current = openSubConv; }, [openSubConv]);
+
+  // Refetch the branch list whenever the selected project changes.
+  useEffect(() => {
+    selectedRef.current = selected;
+    setOpenSubConv(null);
+    if (selected) refreshSubConvs();
+    else setSubConvs([]);
+  }, [selected, refreshSubConvs]);
+
+  const subConvBadge = subConvs.filter((c) => c.running || c.unread).length;
+
+  const handleCreateBranch = useCallback(
+    async ({ contextText, title }: { contextText: string; title: string }) => {
+      const proj = selectedRef.current;
+      if (!proj) return;
+      try {
+        const res = await fetch("/api/conversations/sub", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ projectId: proj.id, contextText, title }),
+        });
+        if (!res.ok) return;
+        const conv: SubConversation = await res.json();
+        setOpenSubConv(conv);
+        refreshSubConvs();
+      } catch {
+        // ignore
+      }
+    },
+    [refreshSubConvs]
+  );
+
+  const handleOpenSubConv = useCallback((conv: SubConversation) => {
+    setOpenSubConv(conv);
+    if (conv.unread) {
+      fetch(`/api/conversations/${conv.id}/read`, { method: "POST" })
+        .then(() => refreshSubConvs())
+        .catch(() => {});
+    }
+  }, [refreshSubConvs]);
+
+  const handleCloseSubConv = useCallback(() => {
+    const conv = openSubConvRef.current;
+    setOpenSubConv(null);
+    if (conv) {
+      fetch(`/api/conversations/${conv.id}/read`, { method: "POST" })
+        .then(() => refreshSubConvs())
+        .catch(() => {});
+    }
+  }, [refreshSubConvs]);
+
+  const handleDeleteSubConv = useCallback((id: number) => {
+    if (openSubConvRef.current?.id === id) setOpenSubConv(null);
+    fetch(`/api/conversations/${id}`, { method: "DELETE" })
+      .then(() => refreshSubConvs())
+      .catch(() => {});
+  }, [refreshSubConvs]);
 
   // Restore selected project from URL first, then localStorage.
   useEffect(() => {
@@ -282,6 +361,17 @@ export function App() {
             ...prev,
             [msg.projectId]: msg.status,
           }));
+        } else if (msg.type === "subchat:update") {
+          const proj = selectedRef.current;
+          if (proj && msg.projectId === proj.id) refreshSubConvs();
+          // Keep the currently-open branch marked read as its turns finish, so
+          // it never contributes to the notification badge while being viewed.
+          const open = openSubConvRef.current;
+          if (open && open.id === msg.conversationId && msg.status !== "running") {
+            fetch(`/api/conversations/${msg.conversationId}/read`, { method: "POST" })
+              .then(() => refreshSubConvs())
+              .catch(() => {});
+          }
         }
       };
 
@@ -399,6 +489,14 @@ export function App() {
                 <Tabs value={tab} onValueChange={handleTabChange} className="desktop-titlebar-no-drag hidden xl:flex">
                   <TabsList>
                     <TabsTrigger value="chat">Chat</TabsTrigger>
+                    <TabsTrigger value="conversations" className="gap-1.5">
+                      Conversations
+                      {subConvBadge > 0 && (
+                        <span className="flex h-4 min-w-4 items-center justify-center rounded-full bg-primary px-1 text-[10px] font-bold text-primary-foreground">
+                          {subConvBadge}
+                        </span>
+                      )}
+                    </TabsTrigger>
                     <TabsTrigger value="todos">Todos</TabsTrigger>
                     <TabsTrigger value="marketing">Marketing</TabsTrigger>
                     <TabsTrigger value="skills">Skills</TabsTrigger>
@@ -417,6 +515,11 @@ export function App() {
                   >
                     <Menu className="h-4 w-4" />
                     <span className="hidden sm:inline">{TAB_LABELS[normalizeTab(tab)]}</span>
+                    {subConvBadge > 0 && (
+                      <span className="flex h-4 min-w-4 items-center justify-center rounded-full bg-primary px-1 text-[10px] font-bold text-primary-foreground">
+                        {subConvBadge}
+                      </span>
+                    )}
                   </button>
                   {tabMenuOpen && (
                     <div className="absolute right-0 top-full z-50 mt-2 w-44 overflow-hidden rounded-lg border border-border bg-popover py-1 shadow-lg">
@@ -425,11 +528,16 @@ export function App() {
                           key={value}
                           type="button"
                           onClick={() => handleTabChange(value)}
-                          className={`flex w-full items-center px-3 py-2 text-left text-sm transition-colors hover:bg-accent ${
+                          className={`flex w-full items-center gap-2 px-3 py-2 text-left text-sm transition-colors hover:bg-accent ${
                             normalizeTab(tab) === value ? "text-foreground" : "text-muted-foreground"
                           }`}
                         >
                           {TAB_LABELS[value]}
+                          {value === "conversations" && subConvBadge > 0 && (
+                            <span className="ml-auto flex h-4 min-w-4 items-center justify-center rounded-full bg-primary px-1 text-[10px] font-bold text-primary-foreground">
+                              {subConvBadge}
+                            </span>
+                          )}
                         </button>
                       ))}
                     </div>
@@ -483,6 +591,16 @@ export function App() {
                     <InsightsTab />
                   </div>
                 )}
+                {tab === "conversations" && (
+                  <div className="h-full overflow-auto">
+                    <ConversationsTab
+                      project={selected}
+                      conversations={subConvs}
+                      onOpen={handleOpenSubConv}
+                      onDelete={handleDeleteSubConv}
+                    />
+                  </div>
+                )}
                 {tab === "chat" && (
                   <ChatTab
                     key={selected.id}
@@ -491,6 +609,7 @@ export function App() {
                     onInputChange={handleChatInputChange}
                     activeWorkspaces={activeWorkspaces[selected.id] ?? []}
                     onToggleWorkspace={(path) => handleToggleWorkspace(selected.id, path)}
+                    onCreateBranch={handleCreateBranch}
                   />
                 )}
               </div>
@@ -507,6 +626,13 @@ export function App() {
             </div>
           )}
         </SidebarInset>
+        {selected && openSubConv && (
+          <SubConversationModal
+            project={selected}
+            conversation={openSubConv}
+            onClose={handleCloseSubConv}
+          />
+        )}
       </SidebarProvider>
     </TooltipProvider>
   );
